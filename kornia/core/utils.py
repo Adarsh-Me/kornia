@@ -19,8 +19,9 @@
 import importlib.util
 import platform
 import sys
+import types
 from dataclasses import asdict, fields, is_dataclass
-from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union, get_args, get_origin, get_type_hints
 
 import torch
 import torch.nn.functional as F
@@ -522,15 +523,45 @@ def dataclass_to_dict(obj: Any) -> Any:
 T = TypeVar("T")
 
 
+def _nested_dataclass_type(annotation: Any) -> Optional[Any]:
+    """Return the dataclass behind X, Optional[X], Union[X, None] or List[X], else None."""
+    if isinstance(annotation, type) and is_dataclass(annotation):
+        return annotation
+    origin = get_origin(annotation)
+    if origin is None:
+        return None
+    if origin is Union or origin is types.UnionType:
+        candidates = [arg for arg in get_args(annotation) if arg is not type(None)]
+        return _nested_dataclass_type(candidates[0]) if len(candidates) == 1 else None
+    if origin in (list, tuple, set, frozenset):
+        args = [arg for arg in get_args(annotation) if arg is not Ellipsis]
+        return _nested_dataclass_type(args[0]) if len(args) == 1 else None
+    return None
+
+
 def dict_to_dataclass(dict_obj: Dict[str, Any], dataclass_type: Type[T]) -> T:
     """Recursively convert dictionaries to dataclass instances."""
     KORNIA_CHECK_TYPE(dict_obj, dict, "Input conf must be dict")
     KORNIA_CHECK(is_dataclass(dataclass_type), "dataclass_type must be a dataclass")
-    field_types: dict[str, Any] = {f.name: f.type for f in fields(dataclass_type)}
+    declared: dict[str, Any] = {f.name: f.type for f in fields(dataclass_type)}
+    try:
+        # resolves string annotations, e.g. every field of a module using ``from __future__ import annotations``
+        declared = {**declared, **get_type_hints(dataclass_type)}
+    except NameError:
+        pass
     constructor_args = {}
     for key, value in dict_obj.items():
-        if key in field_types and is_dataclass(field_types[key]):
-            constructor_args[key] = dict_to_dataclass(value, field_types[key])
+        inner = _nested_dataclass_type(declared.get(key))
+        item = declared.get(key)
+        is_seq = get_origin(item) in (list, tuple, set, frozenset)
+        if inner is None or isinstance(value, inner):
+            constructor_args[key] = value
+        elif is_seq and isinstance(value, (list, tuple, set, frozenset)):
+            constructor_args[key] = type(value)(
+                entry if isinstance(entry, inner) else dict_to_dataclass(entry, inner) for entry in value
+            )
+        elif isinstance(value, dict):
+            constructor_args[key] = dict_to_dataclass(value, inner)
         else:
             constructor_args[key] = value
     # TODO: remove type ignore when https://github.com/python/mypy/issues/14941 be andressed
